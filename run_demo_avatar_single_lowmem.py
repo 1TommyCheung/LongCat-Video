@@ -295,8 +295,12 @@ def generate(args):
 
     # Optimize: replace naive INT8 dequant with torchao's optimized kernels + torch.compile
     if args.use_torchao:
-        print("[OPT] Applying torchao int8_weight_only quantization...")
+        use_fp8 = getattr(args, 'use_fp8', False)
+        quant_label = "float8_weight_only" if use_fp8 else "int8_weight_only"
+        print(f"[OPT] Applying torchao {quant_label} quantization...")
         from torchao.quantization import int8_weight_only, quantize_
+        if use_fp8:
+            from torchao.quantization import float8_weight_only
         from longcat_video.modules.quantization import QuantizedLinear
         # First, convert QuantizedLinear layers back to standard Linear with dequantized weights
         # so torchao can re-quantize with optimized kernels
@@ -314,8 +318,9 @@ def generate(args):
                     linear.bias.data = module.bias.to(torch.bfloat16)
                 setattr(parent, parts[-1], linear)
         torch_gc()
-        # Now apply torchao's optimized int8 quantization
-        quantize_(pipe.dit, int8_weight_only())
+        # Now apply torchao's optimized quantization
+        quant_config = float8_weight_only() if use_fp8 else int8_weight_only()
+        quantize_(pipe.dit, quant_config)
         # Warm up RoPE frequency cache on GPU before torch.compile traces the forward
         print("[OPT] Warming up RoPE frequency cache on GPU...")
         N_t = num_frames  # temporal latents
@@ -480,7 +485,8 @@ if __name__ == "__main__":
     parser.add_argument('--mask_frame_range', type=int, default=3)
     parser.add_argument('--stage_1', type=str, default='ai2v', choices=['ai2v', 'at2v'])
     parser.add_argument('--checkpoint_dir', type=str, default='./weights/LongCat-Video-Avatar-1.5')
-    parser.add_argument('--use_torchao', action='store_true', help='Use torchao optimized INT8 + torch.compile')
+    parser.add_argument('--use_torchao', action='store_true', help='Use torchao optimized quantization + torch.compile')
+    parser.add_argument('--use_fp8', action='store_true', help='Use FP8 weight-only instead of INT8 (requires compute capability 8.9+)')
     parser.add_argument('--num_steps_override', type=int, default=0, help='Override num_inference_steps for testing')
     args = parser.parse_args()
     generate(args)
