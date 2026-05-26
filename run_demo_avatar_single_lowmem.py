@@ -414,17 +414,16 @@ def generate(args):
 
     if cp_rank == 0:
         output_tensor = torch.from_numpy(np.array(video))
-        save_video_ffmpeg(output_tensor, os.path.join(output_dir, f"{stage_1}_demo_1"), raw_speech_path, fps=save_fps, quality=5)
+        save_video_ffmpeg(output_tensor, os.path.join(output_dir, f"segment_001"), raw_speech_path, fps=save_fps, quality=5)
     del output
     torch_gc()
 
-    # Video continuation segments
+    # Video continuation segments — save per-segment to avoid O(n²) memory/encoding
     if num_segments > 1:
-        # Get actual resolution from generated frames (ai2v may crop differently)
         width, height = video[0].size
         ref_latent = latent[:, :, :1].clone()
         current_video = video
-        all_generated_frames = video
+        segment_files = [os.path.join(output_dir, f"segment_001.mp4")]
 
         for segment_idx in range(1, num_segments):
             print(f"[PHASE 3] Generating segment {segment_idx + 1}/{num_segments}...")
@@ -464,13 +463,37 @@ def generate(args):
             new_video = [PIL.Image.fromarray(img) for img in new_video]
             del output
 
-            all_generated_frames.extend(new_video[num_cond_frames:])
-            current_video = new_video
-
+            # Save only NEW frames (skip conditioning overlap)
             if cp_rank == 0:
-                output_tensor = torch.from_numpy(np.array(all_generated_frames))
-                save_video_ffmpeg(output_tensor, os.path.join(output_dir, f"video_continue_{segment_idx + 1}"), raw_speech_path, fps=save_fps, quality=5)
-                del output_tensor
+                new_frames_only = new_video[num_cond_frames:]
+                seg_tensor = torch.from_numpy(np.array(new_frames_only))
+                seg_name = f"segment_{segment_idx + 1:03d}"
+                seg_path = os.path.join(output_dir, f"{seg_name}.mp4")
+                save_video_ffmpeg(seg_tensor, os.path.join(output_dir, seg_name), raw_speech_path, fps=save_fps, quality=5)
+                segment_files.append(seg_path)
+                del seg_tensor, new_frames_only
+                print(f"  Saved {seg_name}.mp4 ({len(new_video) - num_cond_frames} new frames)")
+
+            current_video = new_video
+            torch_gc()
+
+        # Concat all segments + audio into final video
+        if cp_rank == 0:
+            print("[PHASE 4] Concatenating segments into final video...")
+            concat_list = os.path.join(output_dir, "concat_list.txt")
+            with open(concat_list, "w") as f:
+                for seg_file in segment_files:
+                    # Extract the raw video (no audio) for concat
+                    raw_file = seg_file.replace(".mp4", "-cropvideo.mp4")
+                    if os.path.exists(raw_file):
+                        f.write(f"file '{os.path.abspath(raw_file)}'\n")
+                    elif os.path.exists(seg_file):
+                        f.write(f"file '{os.path.abspath(seg_file)}'\n")
+
+            final_video = os.path.join(output_dir, "final_video.mp4")
+            os.system(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c copy {os.path.join(output_dir, 'final_noaudio.mp4')} 2>/dev/null")
+            os.system(f"ffmpeg -y -i {os.path.join(output_dir, 'final_noaudio.mp4')} -i {raw_speech_path} -c:v copy -c:a aac -shortest {final_video} 2>/dev/null")
+            print(f"  Final video: {final_video}")
 
     print("[DONE] Generation complete!")
 
